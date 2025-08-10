@@ -11,6 +11,15 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from tqdm import tqdm
 import numpy as np
 
+# High-level utilities for loading CLIP/CLIP-Surgery, tokenizing text, and
+# producing similarity maps and point prompts for SAM.
+#
+# Paper connections (see `docs/`):
+# - "A Closer Look at the Explainability of CLIP": motivates token-level maps.
+# - "AlignSAM – Aligning SAM to Open Context via RL": uses points derived from
+#   CLIP(-Surgery) similarity to prompt SAM.
+# - "Segment Anything": defines SAM point prompting and mask prediction.
+
 from .build_model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
@@ -88,9 +97,11 @@ def _convert_image_to_rgb(image):
 
 
 def _transform(n_px):
+    # Preprocessing mirrors OpenAI CLIP defaults except the center crop is
+    # removed here to retain full spatial coverage for explanations.
     return Compose([
         Resize((n_px, n_px), interpolation=BICUBIC),
-        #CenterCrop(n_px), # rm center crop to explain whole image
+        # CenterCrop removed to explain the whole image
         _convert_image_to_rgb,
         ToTensor(),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
@@ -223,7 +234,8 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
     Returns
     -------
     A two-dimensional tensor containing the resulting tokens, shape = [number of input strings, context_length].
-    We return LongTensor when torch version is <1.8.0, since older index_select requires indices to be long.
+    We return LongTensor when torch version is <1.8.0, since older index_select
+    requires indices to be long.
     """
     if isinstance(texts, str):
         texts = [texts]
@@ -249,6 +261,14 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77, truncate: b
 
 
 def encode_text_with_prompt_ensemble(model, texts, device, prompt_templates=None):
+    """
+    Encode class names with a prompt ensemble and return normalized features.
+
+    Why prompt ensembling?
+    - As shown in CLIP literature, using multiple templates improves robustness.
+    - For token-level maps, averaging normalized embeddings yields stable text
+      anchors for similarity visualization and for SAM guidance.
+    """
 
     # using default prompt templates for ImageNet
     if prompt_templates == None:
@@ -269,6 +289,14 @@ def encode_text_with_prompt_ensemble(model, texts, device, prompt_templates=None
 
 
 def get_similarity_map(sm, shape):
+    """
+    Convert token-wise similarity to spatial maps.
+
+    Steps
+    - Min-max normalize along token dimension
+    - Reshape from (HW) tokens back to H×W
+    - Bilinear upsample to image resolution
+    """
 
     # min-max norm
     sm = (sm - sm.min(1, keepdim=True)[0]) / (sm.max(1, keepdim=True)[0] - sm.min(1, keepdim=True)[0])
@@ -285,6 +313,15 @@ def get_similarity_map(sm, shape):
 
 
 def clip_feature_surgery(image_features, text_features, redundant_feats=None, t=2):
+    """
+    Perform feature-level surgery to suppress redundant responses and emphasize
+    class-specific evidence across spatial tokens.
+
+    If redundant features are not provided, compute them from element-wise
+    interactions between image and text features and subtract the mean across
+    classes. This aligns with the intuition in explainability: remove broadly
+    shared activations so the remaining signal highlights discriminative parts.
+    """
 
     if redundant_feats != None:
         similarity = image_features @ (text_features - redundant_feats).t()
@@ -310,6 +347,15 @@ def clip_feature_surgery(image_features, text_features, redundant_feats=None, t=
 
 # sm shape N_t
 def similarity_map_to_points(sm, shape, t=0.8, down_sample=2):
+    """
+    Convert a similarity map to positive/negative point prompts for SAM.
+
+    - Select top fraction above threshold as positive points
+    - Select bottom fraction as negatives
+    - Downsample before ranking to reduce noise
+
+    Output matches the SAM predictor API in the original paper.
+    """
     side = int(sm.shape[0] ** 0.5)
     sm = sm.reshape(1, 1, side, side)
 

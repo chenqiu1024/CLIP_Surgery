@@ -6,6 +6,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# This file implements a minimally modified version of the OpenAI CLIP model
+# (ResNet and ViT backbones) that returns token-level features needed for
+# spatial explainability. The comments below connect key parts to the papers:
+#
+# - "A Closer Look at the Explainability of Contrastive Language-Image Pre-training"
+#   Motivates token-level saliency and similarity maps for CLIP.
+# - "AlignSAM – Aligning Segment Anything Model to Open Context via RL"
+#   Uses CLIP-derived similarity maps to generate positive/negative points for SAM.
+# - "Segment Anything" describes how SAM consumes points to produce masks.
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -72,7 +82,11 @@ class AttentionPool2d(nn.Module):
         side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
         new_side = int((x.shape[0] - 1) ** 0.5)
 
-        # update the position embedding during inference for varied input size
+        # During inference, interpolate the positional embedding to accommodate
+        # varied spatial sizes, following common ViT resizing practice. This is
+        # essential for producing dense token features at arbitrary resolution,
+        # later visualized as similarity maps (cf. explainability paper; also
+        # used for SAM point guidance in AlignSAM).
         if side != new_side:
             new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
             new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
@@ -100,8 +114,9 @@ class AttentionPool2d(nn.Module):
             need_weights=False
         )
 
-        #return x[0]
-        return x.transpose(0, 1) # return both cls token and image tokens, B,N,C
+        # Return both CLS and spatial tokens so downstream caller can compute
+        # token-wise similarities for visualization.
+        return x.transpose(0, 1)  # B, N, C
 
 
 class ModifiedResNet(nn.Module):
@@ -137,6 +152,9 @@ class ModifiedResNet(nn.Module):
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
         embed_dim = width * 32  # the ResNet feature dimension
+        # Replace global average pooling with attention pooling to expose
+        # token-level outputs. This mirrors the tokenization in ViTs and is
+        # useful for localizing semantics.
         self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
 
     def _make_layer(self, planes, blocks, stride=1):
@@ -238,6 +256,8 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
+        # Keep attention weights available at the final block for optional
+        # interpretability. Returning per-token features enables spatial maps.
         self.transformer = Transformer(width, layers, heads, need_weights=True)
 
         self.ln_post = LayerNorm(width)
@@ -255,8 +275,8 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        #x = self.ln_post(x[:, 0, :])
-        x = self.ln_post(x) # return both cls token and image tokens
+        # Return CLS and image tokens for downstream spatial similarity maps.
+        x = self.ln_post(x)
 
         if self.proj is not None:
             x = x @ self.proj
@@ -350,8 +370,9 @@ class CLIP(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
+        # Create causal attention mask for text transformer (auto-regressive
+        # style). Vision pathway has full attention among image tokens.
+        # PyTorch uses additive mask; fill with -inf above the diagonal.
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
@@ -362,6 +383,8 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image):
+        # Returns per-token features for visualization and per-image features
+        # for retrieval. Downstream utilities consume the spatial tokens.
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
@@ -374,7 +397,9 @@ class CLIP(nn.Module):
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # Take features from the EOT embedding (EOT token is highest index).
+        # This mirrors OpenAI CLIP and is used to produce the global text
+        # embedding for contrastive similarity.
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x

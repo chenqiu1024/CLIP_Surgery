@@ -9,6 +9,17 @@ from torchvision.transforms import InterpolationMode
 BICUBIC = InterpolationMode.BICUBIC
 from segment_anything import sam_model_registry, SamPredictor
 
+# Demo script illustrating end-to-end usage:
+# 1) Obtain CLIP(-Surgery) token-level similarity maps
+# 2) Convert maps to positive/negative points
+# 3) Feed points to SAM to obtain segmentation masks
+#
+# Paper links (see `docs/`):
+# - AlignSAM (CVPR 2024): Uses RL to align SAM with open-context prompts; this
+#   script shows the classical (non-RL) pipeline with CLIP-Surgery points.
+# - Segment Anything: Defines point-based prompting for mask generation.
+# - A Closer Look at CLIP Explainability: Motivates token-based explanation.
+
 
 ### Init CLIP and data
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,7 +35,7 @@ image = preprocess(pil_img).unsqueeze(0).to(device)
 all_texts = ['airplane', 'bag', 'bed', 'bedclothes', 'bench', 'bicycle', 'bird', 'boat', 'book', 'bottle', 'building', 'bus', 'cabinet', 'car', 'cat', 'ceiling', 'chair', 'cloth', 'computer', 'cow', 'cup', 'curtain', 'dog', 'door', 'fence', 'floor', 'flower', 'food', 'grass', 'ground', 'horse', 'keyboard', 'light', 'motorbike', 'mountain', 'mouse', 'person', 'plate', 'platform', 'potted plant', 'road', 'rock', 'sheep', 'shelves', 'sidewalk', 'sign', 'sky', 'snow', 'sofa', 'table', 'track', 'train', 'tree', 'truck', 'tv monitor', 'wall', 'water', 'window', 'wood']
 target_texts = ['bench', 'person', 'ground', 'building']
 
-### Explain raw predictions of CLIP, which are opposite and noisy.
+### Explain raw predictions of CLIP, which are often opposite and noisy.
 with torch.no_grad():
     # Extract image features
     image_features = model.encode_image(image)
@@ -51,7 +62,7 @@ with torch.no_grad():
             plt.show()
 
 
-### Explain CLIP via our CLIP Surgery
+### Explain CLIP via CLIP-Surgery
 model, preprocess = clip.load("CS-ViT-B/16", device=device)
 model.eval()
 
@@ -63,7 +74,7 @@ with torch.no_grad():
     # Prompt ensemble for text features with normalization
     text_features = clip.encode_text_with_prompt_ensemble(model, all_texts, device)
 
-    # Apply feature surgery
+    # Apply feature surgery to suppress redundant responses
     similarity = clip.clip_feature_surgery(image_features, text_features)
     similarity_map = clip.get_similarity_map(similarity[:, 1:, :], cv2_img.shape[:2])
 
@@ -81,7 +92,7 @@ with torch.no_grad():
             plt.show()
 
 
-### CLIP Surgery using higher resolution
+### CLIP-Surgery using higher resolution
 
 # This preprocess for all next cases
 preprocess =  Compose([Resize((512, 512), interpolation=BICUBIC), ToTensor(),
@@ -114,7 +125,7 @@ with torch.no_grad():
             plt.show()
 
 
-### CLIP Surgery for a single text, without fixed label sets
+### CLIP-Surgery for a single text, without fixed label sets
 texts = ['shoes']
 
 with torch.no_grad():
@@ -144,7 +155,7 @@ with torch.no_grad():
             plt.show()
 
 
-### Text to points from CLIP Surgery to guide SAM
+### Text to points from CLIP-Surgery to guide SAM
 
 # Init SAM
 sam_checkpoint = "sam_vit_h_4b8939.pth"
@@ -189,7 +200,7 @@ with torch.no_grad():
     print('I mean, some failure cases are not caused by wrong points.')
 
 
-### Inference CLIP Surgery and SAM for a single text
+### Inference CLIP-Surgery and SAM for a single text
 texts = ['bench']
 
 with torch.no_grad():
@@ -203,7 +214,7 @@ with torch.no_grad():
     # Extract redundant features from an empty string
     redundant_features = clip.encode_text_with_prompt_ensemble(model, [""], device)
 
-    # CLIP feature surgery with costum redundant features
+    # CLIP feature surgery with custom redundant features
     similarity = clip.clip_feature_surgery(image_features, text_features, redundant_features)[0]
     
     # Inference SAM with points from CLIP Surgery
@@ -223,7 +234,7 @@ with torch.no_grad():
     plt.show()
 
 
-### CLIP Surgery + SAM for combined targets
+### CLIP-Surgery + SAM for combined targets
 
 # We use "+" to combine texts, instead of a whole sentence (obvious text may take the lead thus overlook rest)
 text = 'person+bench'

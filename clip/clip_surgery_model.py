@@ -5,6 +5,24 @@ import numpy as np
 import torch
 from torch import nn
 
+# CLIP-Surgery: Architectural and feature modifications to CLIP for
+# token-level explainability and improved localization.
+#
+# How it connects to papers in `docs/`:
+# - "A Closer Look at the Explainability of Contrastive Language-Image
+#   Pre-training": motivates using token-wise similarity as explanations.
+# - "AlignSAM – Aligning Segment Anything Model to Open Context via RL":
+#   uses CLIP-Surgery maps to produce point prompts (positive/negative) for SAM.
+# - "Segment Anything": SAM consumes point prompts to predict masks.
+#
+# Key ideas implemented here:
+# - Replace the standard QKV self-attention in the last few ViT blocks by a
+#   value-only pathway for k and q (k ← v, q ← v) to focus on semantic content
+#   rather than token-token interactions, producing cleaner token maps.
+# - Keep the CLS token from the original attention path while using the new
+#   value-based path for spatial tokens; this stabilizes global representation
+#   while improving localization.
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -73,12 +91,14 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # original self-attention for the original path
+        # Original self-attention for the original path (kept to preserve CLS
+        # pathway, which often correlates with global semantic embedding).
         attn_ori = (q @ k.transpose(-2, -1)) * self.scale
         attn_ori = attn_ori.softmax(dim=-1)
         attn_ori = self.attn_drop(attn_ori)
 
-        # replace k & q by v
+        # CLIP-Surgery: replace k & q with v (k ← v, q ← v) to emphasize value
+        # content and reduce token-token interaction noise in spatial tokens.
         k = v
         q = k
 
@@ -90,7 +110,8 @@ class Attention(nn.Module):
         else:
             scale = self.scale
         
-        # self-attention, higher temperate for resnets performs better
+        # Self-attention on value features. Using a higher temperature for
+        # ResNets empirically improves stability.
         attn = (q @ k.transpose(-2, -1)) * scale
         attn = (attn).softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -120,7 +141,8 @@ class AttentionPool2d(nn.Module):
 
 
     def forward(self, x):
-        # reform transformer layer after init and load weights, using v only
+        # Reform attention after weights are loaded so it can reuse loaded
+        # parameters. We set q=k=v=V to realize value-only attention.
         if self.attn == None:
             self.attn = Attention(self.output_dim, self.embed_dim, self.num_heads, True)
             self.attn.qkv.weight = torch.nn.Parameter(torch.cat([self.v_proj.weight, self.v_proj.weight, self.v_proj.weight], 0))
@@ -134,7 +156,8 @@ class AttentionPool2d(nn.Module):
         side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
         new_side = int((x.shape[0] - 1) ** 0.5)
 
-        # update the position embedding during inference for varied input size
+        # Interpolate positional embedding for varied input size to produce
+        # dense, high-resolution token maps.
         if side != new_side:
             new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
             new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
@@ -144,7 +167,8 @@ class AttentionPool2d(nn.Module):
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
         x, x_ori = self.attn(x.transpose(0, 1))
 
-        # cls token from the original path, and img tokens from the new path
+        # Keep CLS token from original path and take image tokens from value
+        # path. This keeps global semantic quality while improving spatial maps.
         x[:, 0, :] = x_ori[:, 0, :]
         return x
 
@@ -182,6 +206,8 @@ class ModifiedResNet(nn.Module):
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
         embed_dim = width * 32  # the ResNet feature dimension
+        # Attention pooling returns token-level features used for explainable
+        # similarity maps and SAM guidance.
         self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
 
     def _make_layer(self, planes, blocks, stride=1):
@@ -314,10 +340,12 @@ class VisionTransformer(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor):
 
-        # reform the architecture during first inference
+        # Reform the last several transformer blocks on first forward pass by
+        # swapping their attention with value-only attention (q=k=v). This
+        # preserves loaded weights and avoids retraining.
         if self.attn == None:
             
-            # apply architecture surgery on the last 6 blocks
+            # Apply surgery on the last 6 blocks, as suggested in CLIP-Surgery.
             for i in range(1, 7): # surgery 7, maskclip 2
                 self.attn = Attention(self.embed_dim, self.embed_dim, self.num_heads, True)
                 self.attn.qkv.weight.data = self.transformer.resblocks[-i].attn.in_proj_weight.clone()
@@ -346,7 +374,9 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         x, x_ori = self.transformer(x)
-        x[0, :, :] = x_ori[0, :, :] # clip_surgery
+        # Keep CLS from original attention while using value-only tokens for
+        # spatial positions.
+        x[0, :, :] = x_ori[0, :, :]
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x)
@@ -441,8 +471,8 @@ class CLIPSurgery(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
+        # Causal mask for text tokens; vision tokens have full attention.
+        # PyTorch uses additive mask; fill with -inf above the diagonal.
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
@@ -453,6 +483,8 @@ class CLIPSurgery(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image):
+        # Returns per-token visual features; downstream utilities use spatial
+        # tokens for similarity maps and point extraction.
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
@@ -465,7 +497,8 @@ class CLIPSurgery(nn.Module):
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # Take features from the EOT token, as in OpenAI CLIP, to obtain a
+        # global text embedding for contrastive similarity.
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x

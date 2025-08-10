@@ -4,7 +4,17 @@ from .clip_surgery_model import CLIPSurgery
 
 
 def convert_weights(model: nn.Module):
-    """Convert applicable model parameters to fp16"""
+    """
+    Convert applicable model parameters to fp16.
+
+    Notes
+    -----
+    - Half precision is commonly used for CLIP inference to save memory and
+      accelerate compute while preserving quality.
+    - This conversion mirrors practices from OpenAI CLIP.
+    - Keep in fp32 for SAM or CPU-only scenarios if numerical stability is a
+      concern.
+    """
 
     def _convert_weights_to_fp16(l):
         if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
@@ -28,6 +38,30 @@ def convert_weights(model: nn.Module):
 
 
 def build_model(name: str, state_dict: dict):
+    """
+    Build a CLIP or CLIP-Surgery model from a checkpoint state dict.
+
+    Parameters
+    ----------
+    name : str
+        Model identifier. If it contains the prefix "CS-", the modified
+        CLIP-Surgery architecture is instantiated.
+    state_dict : dict
+        Weights loaded from the original CLIP checkpoints.
+
+    Returns
+    -------
+    torch.nn.Module (eval mode)
+
+    How it relates to papers
+    ------------------------
+    - The vanilla CLIP graph structure follows OpenAI CLIP.
+    - The CLIP-Surgery path modifies the attention in the last ViT blocks
+      to emphasize value-only pathways and token-level spatial outputs, as in
+      the explainability direction discussed in "A Closer Look at the
+      Explainability of CLIP" and used for generating token maps that guide
+      SAM points in AlignSAM.
+    """
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -52,6 +86,7 @@ def build_model(name: str, state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
+    # Instantiate CLIP-Surgery when explicitly requested by name
     if 'CS-' in name:
         model = CLIPSurgery(
             embed_dim,
@@ -69,6 +104,8 @@ def build_model(name: str, state_dict: dict):
         if key in state_dict:
             del state_dict[key]
 
-    #convert_weights(model)
+    # Keeping fp32 by default for numerical stability with downstream tasks
+    # (e.g., SAM point maps). Enable if you prefer fp16 memory/latency.
+    # convert_weights(model)
     model.load_state_dict(state_dict)
     return model.eval()

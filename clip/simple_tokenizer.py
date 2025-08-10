@@ -6,6 +6,11 @@ from functools import lru_cache
 import ftfy
 import regex as re
 
+# A lightweight reimplementation of the BPE tokenizer used by OpenAI CLIP.
+# It provides `<|startoftext|>` and `<|endoftext|>` tokens and performs byte
+# fallback for full UTF-8 coverage. The behavior mirrors the original CLIP
+# tokenizer so that text embeddings are comparable.
+
 
 @lru_cache()
 def default_bpe():
@@ -21,7 +26,7 @@ def bytes_to_unicode():
     When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
     This is a signficant percentage of your normal, say, 32K bpe vocab.
     To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
-    And avoids mapping to whitespace/control characters the bpe code barfs on.
+    And avoids mapping to whitespace/control characters the BPE code barfs on.
     """
     bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
     cs = bs[:]
